@@ -1,10 +1,9 @@
 {
   "name": "openai-chat-fn",
   "version": "1.0.0",
-  "private": true,
-  "main": "index.js",
+  "type": "module",
   "dependencies": {
     "mssql": "^10.0.0",
-    "openai": "^4.0.0"
+    "openai": "^4.104.0"
   }
 }
