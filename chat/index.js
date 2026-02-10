@@ -16,7 +16,9 @@ const televisores = [
     resolucion: "4K",
     pulgadas: 55,
     precio: 2999,
-    url: "https://www.samsung.com/pe/tvs/qled-tv/q80a-55-inch-qn55q80aagxpe/"
+    seller: "Samsung Perú",
+    url_producto:
+      "https://www.samsung.com/pe/tvs/qled-tv/q80a-55-inch-qn55q80aagxpe/"
   }
 ];
 
@@ -52,7 +54,8 @@ Familia: ${tv.familia}
 Resolucion: ${tv.resolucion}
 Pulgadas: ${tv.pulgadas}
 Precio: ${tv.precio}
-URL: ${tv.url}
+Vendedor: ${tv.seller}
+URL_PRODUCTO: ${tv.url_producto}
 `).join("\n");
 
     /* ---- OPENAI ---- */
@@ -78,8 +81,10 @@ En base a su requerimiento se le proporciona el siguiente producto:
 - Name:
 - Familia:
 - Resolucion:
+- Pulgadas:
+- Vendedor:
 - Precio:
-- URL:
+- URL_PRODUCTO:
 
 Base de datos:
 ${contextoBD}
