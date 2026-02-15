@@ -1,10 +1,9 @@
 {
-  "name": "openai-chat-fn",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "mssql": "^10.0.4",
-    "node-fetch": "^3.3.2",
-    "openai": "^4.104.0"
-  }
+	"name": "openai-chat-fn",
+	"version": "1.0.0",
+	"dependencies": {
+		"mssql": "^10.0.4",
+		"node-fetch": "^3.3.2",
+		"openai": "^4.104.0"
+	}
 }
