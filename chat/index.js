@@ -1,4 +1,5 @@
 import { AzureOpenAI } from "openai";
+import sql from "mssql";
 
 /* ========= VALIDACIÓN ========= */
 function hasEnoughInfo(message) {
@@ -8,19 +9,22 @@ function hasEnoughInfo(message) {
   return hasInches && hasBudget && hasFamily;
 }
 
-/* ========= DATA SIMULADA (BD) ========= */
-const televisores = [
-  {
-    nombre: "Samsung QLED Q80A",
-    familia: "QLED",
-    resolucion: "4K",
-    pulgadas: 55,
-    precio: 2999,
-    seller: "Samsung Perú",
-    url_producto:
-      "https://www.samsung.com/pe/tvs/qled-tv/q80a-55-inch-qn55q80aagxpe/"
-  }
-];
+function extractData(message) {
+  const inches = message.match(/(\d+)\s?(pulgadas|")/i)?.[1];
+  const budget = message.match(/(\d{3,})/)?.[1];
+  const family = message.match(/(led|qled|oled|nanocell)/i)?.[1]?.toLowerCase();
+
+  return {
+    inches: inches ? parseInt(inches) : null,
+    budget: budget ? parseInt(budget) : null,
+    family
+  };
+}
+
+function cleanPrice(price) {
+  if (!price) return null;
+  return parseFloat(price.replace(/[^\d.]/g, ""));
+}
 
 /* ========= AZURE FUNCTION ========= */
 export default async function (context, req) {
@@ -29,13 +33,15 @@ export default async function (context, req) {
 
     if (!message) {
       context.res = {
-        status: 400,
-        body: { error: "Falta el campo message" }
+        status: 200,
+        body: {
+          answer:
+            "Buenas soy su BOT asistente, indícame:\n- Pulgadas\n- Presupuesto\n- Familia (LED / QLED / OLED / NanoCell)\n\nEjemplo:\n👉 55 pulgadas QLED hasta 3000 soles"
+        }
       };
       return;
     }
 
-    /* ---- SI FALTAN DATOS ---- */
     if (!hasEnoughInfo(message)) {
       context.res = {
         status: 200,
@@ -47,18 +53,103 @@ export default async function (context, req) {
       return;
     }
 
-    /* ---- CONTEXTO BD ---- */
-    const contextoBD = televisores.map(tv => `
-Name: ${tv.nombre}
-Familia: ${tv.familia}
-Resolucion: ${tv.resolucion}
-Pulgadas: ${tv.pulgadas}
-Precio: ${tv.precio}
-Vendedor: ${tv.seller}
-URL_PRODUCTO: ${tv.url_producto}
+    const { inches, budget, family } = extractData(message);
+
+    /* ========= CONEXIÓN SQL ========= */
+    const pool = await sql.connect({
+      server: process.env.SQL_SERVER,
+      database: process.env.SQL_DATABASE,
+      user: process.env.SQL_USER,
+      password: process.env.SQL_PASSWORD,
+      options: { encrypt: true }
+    });
+
+    const request = pool.request();
+    request.input("family", sql.NVarChar, `%${family}%`);
+
+    const result = await request.query(`
+      SELECT TOP 100
+        name,
+        family,
+        seller,
+        url_product,
+        internet_price,
+        event_price,
+        normal_price,
+        cmr_price
+      FROM dbo.hd_televisores
+      WHERE LOWER(family) LIKE @family
+    `);
+
+    if (!result.recordset.length) {
+      context.res = {
+        status: 200,
+        body: { answer: "No hay televisores disponibles en esa familia." }
+      };
+      return;
+    }
+
+    /* ========= PROCESAR Y CALCULAR SCORE ========= */
+    const televisores = result.recordset
+      .map(tv => {
+
+        const prices = [
+          tv.internet_price,
+          tv.event_price,
+          tv.normal_price,
+          tv.cmr_price
+        ]
+          .map(cleanPrice)
+          .filter(p => p);
+
+        if (!prices.length) return null;
+
+        const bestPrice = Math.min(...prices);
+
+        // extraer pulgadas desde el nombre
+        const inchesMatch = tv.name.match(/(\d{2,3})/);
+        const tvInches = inchesMatch ? parseInt(inchesMatch[1]) : inches;
+
+        const priceDiff = Math.abs(bestPrice - budget);
+        const inchDiff = Math.abs(tvInches - inches);
+
+        const score = priceDiff + (inchDiff * 500);
+
+        return {
+          Name: tv.name,
+          Familia: tv.family,
+          Pulgadas: tvInches,
+          Vendedor: tv.seller,
+          Precio: bestPrice,
+          URL_PRODUCTO: tv.url_product,
+          score
+        };
+      })
+      .filter(tv => tv !== null);
+
+    if (!televisores.length) {
+      context.res = {
+        status: 200,
+        body: { answer: "No encontré televisores disponibles." }
+      };
+      return;
+    }
+
+    televisores.sort((a, b) => a.score - b.score);
+
+    const mejores = televisores.slice(0, 5);
+
+    const contextoBD = mejores.map(tv => `
+Name: ${tv.Name}
+Familia: ${tv.Familia}
+Resolucion: 4K
+Pulgadas: ${tv.Pulgadas}
+Vendedor: ${tv.Vendedor}
+Precio: ${tv.Precio}
+URL_PRODUCTO: ${tv.URL_PRODUCTO}
 `).join("\n");
 
-    /* ---- OPENAI ---- */
+    /* ========= OPENAI ========= */
     const client = new AzureOpenAI({
       apiKey: process.env.AZURE_OPENAI_API_KEY,
       apiVersion: process.env.AZURE_OPENAI_API_VERSION,
@@ -90,25 +181,20 @@ Base de datos:
 ${contextoBD}
 `
         },
-        {
-          role: "user",
-          content: message
-        }
+        { role: "user", content: message }
       ]
     });
 
     context.res = {
       status: 200,
-      body: {
-        answer: completion.choices[0].message.content
-      }
+      body: { answer: completion.choices[0].message.content }
     };
 
   } catch (error) {
     context.log("ERROR:", error);
     context.res = {
       status: 500,
-      body: { error: "Error interno del servidor" }
+      body: { error: error.message }
     };
   }
 }
