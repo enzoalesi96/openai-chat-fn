@@ -23,18 +23,27 @@ function extractData(message) {
 
 function cleanPrice(price) {
   if (!price) return null;
-  return parseFloat(price.replace(/[^\d.]/g, ""));
+  return parseFloat(price.toString().replace(/[^\d.]/g, ""));
 }
+
+/* ========= AZURE FUNCTION ========= */
 
 module.exports = async function (context, req) {
 
+  let pool;
+
   try {
 
+    context.log("🔵 Function iniciada");
+
     const message = req.body?.message;
+
+    context.log("📩 Mensaje recibido:", message);
 
     if (!message || !hasEnoughInfo(message)) {
       context.res = {
         status: 200,
+        headers: { "Content-Type": "application/json" },
         body: {
           info:
             "Hola 👋 soy su BOT asistente, indícame:\n- Pulgadas\n- Presupuesto\n- Familia (LED / QLED / OLED / NanoCell)\n\nEjemplo:\n👉 55 pulgadas QLED hasta 3000 soles"
@@ -45,16 +54,24 @@ module.exports = async function (context, req) {
 
     const { inches, budget, family } = extractData(message);
 
-    const pool = await sql.connect({
+    context.log("🔍 Datos extraídos:", { inches, budget, family });
+
+    /* ========= CONEXIÓN SQL CORREGIDA ========= */
+
+    pool = await sql.connect({
       server: process.env.SQL_SERVER,
       database: process.env.SQL_DATABASE,
       user: process.env.SQL_USER,
       password: process.env.SQL_PASSWORD,
+      port: 1433,
       options: {
         encrypt: true,
-        trustServerCertificate: false
+        trustServerCertificate: true,
+        enableArithAbort: true
       }
     });
+
+    context.log("✅ Conexión SQL exitosa");
 
     const request = pool.request();
     request.input("family", sql.NVarChar, `%${family}%`);
@@ -74,9 +91,12 @@ module.exports = async function (context, req) {
       WHERE LOWER(family) LIKE @family
     `);
 
+    context.log("📊 Registros encontrados:", result.recordset.length);
+
     if (!result.recordset.length) {
       context.res = {
         status: 200,
+        headers: { "Content-Type": "application/json" },
         body: { info: "No hay televisores disponibles en esa familia." }
       };
       return;
@@ -112,12 +132,12 @@ module.exports = async function (context, req) {
 
     }).filter(Boolean);
 
-    // 🔥 PRIORIDAD PRESUPUESTO
     const dentroPresupuesto = televisores.filter(tv => tv.precio <= budget);
 
     if (!dentroPresupuesto.length) {
       context.res = {
         status: 200,
+        headers: { "Content-Type": "application/json" },
         body: {
           info: `❌ No contamos con televisores de ${inches}" ${family.toUpperCase()} dentro del presupuesto de ${budget} soles.`
         }
@@ -125,8 +145,7 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Ordenar por precio más cercano al presupuesto
-    dentroPresupuesto.sort((a, b) => 
+    dentroPresupuesto.sort((a, b) =>
       Math.abs(budget - a.precio) - Math.abs(budget - b.precio)
     );
 
@@ -134,6 +153,7 @@ module.exports = async function (context, req) {
 
     context.res = {
       status: 200,
+      headers: { "Content-Type": "application/json" },
       body: {
         message: `📌 Se recomienda este televisor porque se ajusta al presupuesto solicitado (${budget} soles).`,
         product: mejor
@@ -142,13 +162,23 @@ module.exports = async function (context, req) {
 
   } catch (error) {
 
-    context.log("ERROR:", error);
+    context.log("❌ ERROR COMPLETO:", error);
+    context.log("STACK:", error.stack);
 
     context.res = {
       status: 500,
+      headers: { "Content-Type": "application/json" },
       body: {
         error: error.message
       }
     };
+
+  } finally {
+
+    if (pool) {
+      await pool.close();
+      context.log("🔒 Conexión SQL cerrada");
+    }
+
   }
 };
