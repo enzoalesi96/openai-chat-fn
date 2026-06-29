@@ -9,6 +9,8 @@ import os
 import azure.functions as func
 
 from shared.helpers import has_enough_info, extract_params, CORS_HEADERS
+from shared.databricks_client import predict_cluster, fetch_top5
+from shared.aoai_client import generate_recommendation
 
 app    = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 logger = logging.getLogger(__name__)
