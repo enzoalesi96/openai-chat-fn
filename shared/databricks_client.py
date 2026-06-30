@@ -2,7 +2,7 @@
 shared/databricks_client.py
 ----------------------------
 Interacciones con Databricks:
-  1. Invocar el Model Serving endpoint (visionmatch-kmeans) para obtener el cluster_id.
+  1. Invocar el Model Serving endpoint (visionmatch-kmeans) para obtener el prediction.
   2. Consultar la tabla Delta Lake directamente via SQL Statement API
      para recuperar el top-5 de candidatos del cluster del usuario.
 """
@@ -29,7 +29,7 @@ SERVING_ENDPOINT_URL = (
 )
 
 # Tabla fuente en Delta Lake
-SOURCE_TABLE = "adbvisualmatch_7405610080077220.schema_tv.data_oh_completa"
+SOURCE_TABLE = "adbvisualmatch_7405610080077220.schema_tv.data_televisores"
 
 # Mapeo familia → numérico (igual que modelo_televisores.py)
 FAMILY_NUM: dict[str, float] = {
@@ -46,7 +46,7 @@ _AUTH_HEADERS = {
 
 
 # ---------------------------------------------------------------------------
-# 1. Invocar el Model Serving endpoint → cluster_id
+# 1. Invocar el Model Serving endpoint → prediction
 # ---------------------------------------------------------------------------
 
 def predict_cluster(pulgadas: int, presupuesto: float, familia: str) -> int:
@@ -112,47 +112,68 @@ def fetch_top5(
     """
     Consulta la tabla Delta Lake y devuelve el top-5 de televisores.
 
-    Estrategia:
-      1. Intenta filtrar por el cluster del usuario (familia_num == cluster_id).
-      2. Si hay < 5 resultados, amplía a todo el catálogo dentro del presupuesto.
+    Adaptado al NUEVO formato de datos (data_televisores):
+      - Precios YA son numéricos (DOUBLE), no strings → sin REGEXP_REPLACE.
+      - Campos de precio: discount_price, event_price, internet_price, normal_price
+        (ya NO existe cmr_price).
+      - Pulgadas en formatos variados en el nombre: 50", 32'', 43”, "65 pulgadas",
+        "55 Pulg" → regex flexible.
+      - Se incluye la TIENDA (seller) en los resultados.
 
-    Correcciones de formato de datos reales:
-      - precios son STRING con coma de miles ("1,199.00") y vacíos como "--".
-      - TRY_CAST + NULLIF para evitar que un precio inválido rompa la query.
-      - LEAST con COALESCE para tomar el mínimo entre precios válidos.
-      - pulgadas extraídas del patrón "-NN-" del nombre.
+    Estrategia:
+      1. Filtra por el cluster del usuario (familia_num == cluster_id).
+      2. Si hay < 5 resultados, amplía a todo el catálogo dentro del presupuesto.
     """
     presupuesto_max = presupuesto * 1.10
 
-    # CTE base reutilizable: limpia precios y extrae pulgadas + familia_num
+    # CTE base: calcula precio mínimo, pulgadas y familia_num
+    # Nota: los precios ya son numéricos; solo tomamos el mínimo válido (>0).
+    # El regex de pulgadas busca un número 2-3 dígitos seguido de un indicador
+    # de pulgadas ("|''|”|pulg) y, si no, cae a un número suelto en rango de TV.
     base_cte = f"""
-    WITH precios_limpios AS (
+    WITH base AS (
       SELECT
-        name, family, seller, url_product, url_image,
-        TRY_CAST(NULLIF(REGEXP_REPLACE(internet_price, '[^0-9.]', ''), '') AS DOUBLE) AS p_internet,
-        TRY_CAST(NULLIF(REGEXP_REPLACE(event_price,    '[^0-9.]', ''), '') AS DOUBLE) AS p_event,
-        TRY_CAST(NULLIF(REGEXP_REPLACE(normal_price,   '[^0-9.]', ''), '') AS DOUBLE) AS p_normal,
-        TRY_CAST(NULLIF(REGEXP_REPLACE(cmr_price,      '[^0-9.]', ''), '') AS DOUBLE) AS p_cmr,
-        TRY_CAST(REGEXP_EXTRACT(name, '-([0-9]{{2,3}})-', 1) AS INT) AS pulgadas,
+        name,
+        family,
+        seller,
+        url_product,
+        url_image,
+        brand,
+        -- TIENDA: se deriva del dominio de la URL del producto
         CASE
-          WHEN UPPER(family) LIKE '%OLED%'     THEN 2.0
-          WHEN UPPER(family) LIKE '%QLED%'     THEN 1.0
-          WHEN UPPER(family) LIKE '%NANOCELL%' THEN 3.0
+          WHEN LOWER(url_product) LIKE '%oechsle%'  THEN 'Oechsle'
+          WHEN LOWER(url_product) LIKE '%plazavea%' THEN 'Plaza Vea'
+          WHEN LOWER(url_product) LIKE '%tottus%'   THEN 'Tottus'
+          ELSE 'Otra tienda'
+        END AS tienda,
+        -- Precio mínimo válido entre los 4 campos numéricos
+        LEAST(
+          COALESCE(NULLIF(CAST(discount_price AS DOUBLE), 0), 999999),
+          COALESCE(NULLIF(CAST(event_price    AS DOUBLE), 0), 999999),
+          COALESCE(NULLIF(CAST(internet_price AS DOUBLE), 0), 999999),
+          COALESCE(NULLIF(CAST(normal_price   AS DOUBLE), 0), 999999)
+        ) AS precio,
+        -- Pulgadas: primero patrón "NN<indicador>", luego número suelto en rango
+        COALESCE(
+          TRY_CAST(REGEXP_EXTRACT(name, '([0-9]{{2,3}}) *(?:"|\'\'|”|[Pp]ulg)', 1) AS INT),
+          TRY_CAST(REGEXP_EXTRACT(name, '\\b([2-9][0-9]|1[0-9]{{2}})\\b', 1) AS INT)
+        ) AS pulgadas,
+        -- Encoding de familia (igual que el modelo KMeans)
+        CASE
+          WHEN UPPER(family) LIKE '%OLED%' AND UPPER(family) NOT LIKE '%QLED%' THEN 2.0
+          WHEN UPPER(family) LIKE '%QLED%' OR UPPER(family) LIKE '%QNED%'       THEN 1.0
+          WHEN UPPER(family) LIKE '%NANO%'                                       THEN 3.0
           ELSE 0.0
         END AS familia_num
       FROM {SOURCE_TABLE}
     ),
     con_precio AS (
-      SELECT
-        name, family, seller, url_product, url_image, pulgadas, familia_num,
-        LEAST(
-          COALESCE(NULLIF(p_internet, 0), 999999),
-          COALESCE(NULLIF(p_event,    0), 999999),
-          COALESCE(NULLIF(p_normal,   0), 999999),
-          COALESCE(NULLIF(p_cmr,      0), 999999)
-        ) AS precio
-      FROM precios_limpios
-      WHERE pulgadas IS NOT NULL
+      SELECT *
+      FROM base
+      WHERE precio < 999999
+        AND precio > 0
+        AND pulgadas IS NOT NULL
+        AND pulgadas BETWEEN 20 AND 110
     )
     """
 
@@ -162,24 +183,24 @@ def fetch_top5(
       family AS familia,
       pulgadas,
       ROUND(precio, 2) AS precio,
+      tienda,
       seller AS vendedor,
+      brand AS marca,
       url_product AS url,
       url_image AS imagen,
       ROUND((precio / {presupuesto}) * 100 - ABS(pulgadas - {pulgadas_ref}) * 2.0, 2) AS score
     FROM con_precio
-    WHERE precio < 999999
-      AND precio <= {presupuesto_max}
+    WHERE precio <= {presupuesto_max}
     """
 
-    # 1) Intento con filtro de cluster
+    # 1) Con filtro de cluster
     sql_cluster = (
-        base_cte
-        + select_tail
+        base_cte + select_tail
         + f" AND familia_num = {float(cluster_id)} ORDER BY score DESC LIMIT 5"
     )
     rows = _run_sql(sql_cluster)
 
-    # 2) Fallback: sin filtro de cluster, todo el catálogo en presupuesto
+    # 2) Fallback: todo el catálogo dentro del presupuesto
     if len(rows) < 5:
         logger.warning(
             "Solo %d candidatos en cluster %d. Ampliando a todo el catálogo...",
