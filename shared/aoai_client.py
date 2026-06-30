@@ -90,8 +90,7 @@ def generate_recommendation(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_content},
         ],
-        temperature=0.4,
-        max_tokens=700,
+        max_completion_tokens=700,
     )
 
     return response.choices[0].message.content.strip()
