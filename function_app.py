@@ -256,8 +256,12 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
     if not products:
         return _json_response({
             "message": (
-                f"No encontré televisores de {inches}\" dentro de S/ {budget:.0f}. "
-                f"¿Quieres que amplíe el presupuesto o probemos otra tecnología?"
+                f"Lo siento, no tengo actualmente ningún televisor que cumpla con "
+                f"esas especificaciones: {family} de {inches}\" dentro de un "
+                f"presupuesto de S/ {budget:.0f}. 😕\n\n"
+                f"¿Te gustaría que ajustemos algo? Por ejemplo, ampliar un poco el "
+                f"presupuesto, considerar otro tamaño, o probar con otra tecnología "
+                f"de pantalla."
             )
         })
 
