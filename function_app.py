@@ -179,38 +179,66 @@ def check_openai(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ---------------------------------------------------------------------------
-# Chat principal
+# Chat principal — conversacional
 # ---------------------------------------------------------------------------
 
 @app.route(route="chat", methods=["GET", "POST"])
 def chat(req: func.HttpRequest) -> func.HttpResponse:
-    logger.info("VisionMatch AI iniciada")
+    """
+    Endpoint conversacional.
 
+    Espera un body JSON con el historial completo:
+      { "history": [ {"role":"user","content":"hola"}, ... ] }
+
+    También acepta el formato simple { "message": "..." } por compatibilidad.
+
+    Flujo:
+      1. GPT-5 conversa naturalmente con el usuario.
+      2. Cuando GPT detecta que ya tiene pulgadas + presupuesto + familia,
+         devuelve una señal; el backend ejecuta KMeans + Delta Lake.
+      3. GPT redacta la recomendación final con el top-5.
+    """
+    logger.info("VisionMatch AI - chat conversacional")
+
+    # ── Leer historial o mensaje simple ────────────────────────────────────
+    history = []
     try:
-        body    = req.get_json()
-        message = body.get("message", "").strip()
+        body = req.get_json()
+        if isinstance(body.get("history"), list) and body["history"]:
+            history = body["history"]
+        elif body.get("message"):
+            history = [{"role": "user", "content": body["message"].strip()}]
     except Exception:
-        message = req.params.get("message", "").strip()
+        msg = req.params.get("message", "").strip()
+        if msg:
+            history = [{"role": "user", "content": msg}]
 
-    # Import local para no afectar arranque
-    from shared.helpers import has_enough_info, extract_params
-
-    if not message or not has_enough_info(message):
+    if not history:
         return _json_response({
-            "info": (
-                "Hola soy VisionMatch AI, tu asistente de televisores.\n"
-                "Para ayudarte necesito:\n"
-                "  - Pulgadas\n"
-                "  - Presupuesto en soles\n"
-                "  - Tecnología (LED / QLED / OLED / NanoCell)\n\n"
-                "Ejemplo: 55 pulgadas QLED hasta 3000 soles"
-            )
+            "message": "Hola, soy VisionMatch AI. ¿En qué televisor estás pensando hoy?"
         })
 
-    params = extract_params(message)
-    inches = params["inches"]
-    budget = params["budget"]
-    family = params["family"]
+    # ── Paso 1: conversar (GPT decide si charlar o si ya hay datos) ─────────
+    from shared.aoai_client import conversar, generate_recommendation
+
+    try:
+        resultado = conversar(history)
+    except Exception as exc:
+        logger.error("Error en conversación: %s", exc)
+        return _json_response(
+            {"message": "Disculpa, tuve un problema procesando tu mensaje. ¿Puedes repetirlo?"},
+            status=200,
+        )
+
+    # ── Si todavía falta info → devolver la charla y esperar más ───────────
+    if resultado["tipo"] == "charla":
+        return _json_response({"message": resultado["texto"]})
+
+    # ── Si ya hay datos → ejecutar el pipeline ─────────────────────────────
+    inches = resultado["pulgadas"]
+    budget = resultado["presupuesto"]
+    family = resultado["familia"]
+    logger.info("Datos completos: %s\" / S/%s / %s", inches, budget, family)
 
     from shared.databricks_client import predict_cluster, fetch_top5
     try:
@@ -227,27 +255,23 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
 
     if not products:
         return _json_response({
-            "info": (
-                f"No encontramos televisores {family.upper()} de {inches}\" "
-                f"dentro del presupuesto de S/ {budget:.0f}. "
-                f"Intenta ampliar el presupuesto o cambiar la tecnologia."
+            "message": (
+                f"No encontré televisores de {inches}\" dentro de S/ {budget:.0f}. "
+                f"¿Quieres que amplíe el presupuesto o probemos otra tecnología?"
             )
         })
 
-    from shared.aoai_client import generate_recommendation
     try:
         ai_response = generate_recommendation(
-            user_message=message, inches=inches,
-            budget=budget, family=family, products=products,
+            user_message="", inches=inches, budget=budget,
+            family=family, products=products,
         )
     except Exception as exc:
-        logger.error("Error OpenAI: %s", exc)
+        logger.error("Error OpenAI recomendacion: %s", exc)
         top = products[0]
         ai_response = (
-            f"Recomendacion: {top['name']}\n"
-            f"- {top['pulgadas']}\" | {top['familia']} | S/ {top['precio']}\n"
-            f"- Vendedor: {top['vendedor']}\n"
-            f"- Ver: {top['url']}"
+            f"Te recomiendo el {top['name']}: {top['pulgadas']}\", "
+            f"{top['familia']}, S/ {top['precio']} ({top['vendedor']})."
         )
 
     return _json_response({"message": ai_response, "products": products})

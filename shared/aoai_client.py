@@ -1,8 +1,14 @@
 """
 shared/aoai_client.py
 ----------------------
-Cliente para Azure OpenAI con el modelo gpt-4o-mini.
-Genera la respuesta conversacional final a partir del top-5 de Databricks.
+Cliente para Azure OpenAI (gpt-5-mini).
+
+Dos responsabilidades:
+  1. conversar(): lleva la conversación natural y, cuando detecta que ya tiene
+     pulgadas + presupuesto + familia, devuelve una señal estructurada para
+     que el backend ejecute el pipeline KMeans.
+  2. generate_recommendation(): redacta la recomendación final a partir del
+     top-5 que devuelve Databricks.
 """
 
 import os
@@ -11,10 +17,6 @@ import logging
 from openai import AzureOpenAI
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Cliente (singleton ligero — las Functions reusan el contenedor)
-# ---------------------------------------------------------------------------
 
 _client: AzureOpenAI | None = None
 
@@ -30,32 +32,130 @@ def _get_client() -> AzureOpenAI:
     return _client
 
 
-DEPLOYMENT = os.environ.get("AOAI_DEPLOYMENT", "gpt-4o-mini")
+DEPLOYMENT = os.environ.get("AOAI_DEPLOYMENT", "gpt-5-mini")
+
 
 # ---------------------------------------------------------------------------
-# System prompt
+# Prompt de conversación
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
-Eres VisionMatch AI, un asistente experto en televisores para el mercado peruano.
-Tu tarea es ayudar al cliente a elegir el mejor televisor según su presupuesto,
-las pulgadas deseadas y la tecnología de pantalla (LED, QLED, OLED, NanoCell).
+CONVERSATION_PROMPT = """
+Eres VisionMatch AI, un asistente experto y amigable en televisores para el
+mercado peruano. Conversas de forma natural y cálida, como un buen vendedor
+de tienda que asesora sin presionar.
 
-Recibirás un JSON con hasta 5 televisores preseleccionados por un modelo KMeans
-entrenado sobre el catálogo real. Debes:
+Tu objetivo es ayudar al cliente a encontrar su televisor ideal. Para poder
+darle recomendaciones del catálogo necesitas TRES datos:
+  1. Pulgadas deseadas (ej: 55)
+  2. Presupuesto en soles (ej: 3000)
+  3. Tecnología/familia de pantalla: LED, QLED, OLED o NanoCell
 
-1. Presentar brevemente el televisor mejor posicionado (rank 1) como tu
-   recomendación principal, explicando por qué se ajusta al pedido.
-2. Mencionar las otras opciones de forma concisa como alternativas.
-3. Incluir el precio en soles (S/) y el vendedor para cada opción.
-4. Si hay URLs de producto, invita al usuario a hacer clic para ver más detalles.
-5. Mantén un tono amigable, experto y en español peruano.
-6. No inventar datos — usa solo la información del JSON proporcionado.
+REGLAS DE CONVERSACIÓN:
+- Saluda con calidez y pregunta en qué puedes ayudar. NO dispares de golpe la
+  lista de los tres datos como un formulario.
+- Si el cliente da información parcial, agradece lo que dio y pregunta SOLO por
+  lo que falta, de forma conversacional.
+- Si el cliente no sabe qué tecnología elegir, explícale brevemente las
+  diferencias (LED es económico, QLED brillo y color, OLED el mejor negro y
+  contraste, NanoCell buen color a precio medio) y ayúdalo a decidir.
+- Si el cliente pregunta cosas generales sobre TVs, respóndelas con tu
+  conocimiento experto y luego retoma suavemente hacia sus necesidades.
+- Mantén las respuestas breves y naturales (2-4 frases). Tono peruano cercano.
+
+CUANDO YA TENGAS LOS TRES DATOS (pulgadas, presupuesto y familia):
+Responde ÚNICAMENTE con un bloque JSON, sin texto adicional, con este formato exacto:
+{"listo": true, "pulgadas": 55, "presupuesto": 3000, "familia": "QLED"}
+
+Mientras NO tengas los tres datos, responde con texto conversacional normal
+(NO uses JSON en ese caso).
 """.strip()
 
 
 # ---------------------------------------------------------------------------
-# Función principal
+# Prompt de recomendación final
+# ---------------------------------------------------------------------------
+
+RECOMMENDATION_PROMPT = """
+Eres VisionMatch AI, asistente experto en televisores para Perú.
+
+Recibirás un JSON con hasta 5 televisores preseleccionados por un modelo KMeans.
+Redacta una recomendación cálida y natural:
+
+1. Presenta el televisor mejor posicionado (rank 1) como recomendación principal
+   y explica brevemente por qué encaja con lo que pidió el cliente.
+2. Menciona 2-3 alternativas de forma concisa.
+3. Incluye precio en soles (S/) y vendedor de cada opción.
+4. Si la familia encontrada no coincide exactamente con la pedida, coméntalo con
+   naturalidad y ofrece la mejor alternativa disponible.
+5. Tono amigable, experto, español peruano. No inventes datos.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# 1. Conversar — decide si charlar o si ya hay datos para ejecutar
+# ---------------------------------------------------------------------------
+
+def conversar(history: list[dict]) -> dict:
+    """
+    Recibe el historial de mensajes [{"role": "user"/"assistant", "content": ...}]
+    y devuelve uno de dos resultados:
+      - {"tipo": "charla",  "texto": "<respuesta conversacional>"}
+      - {"tipo": "listo",   "pulgadas": int, "presupuesto": float, "familia": str}
+    """
+    client = _get_client()
+
+    messages = [{"role": "system", "content": CONVERSATION_PROMPT}] + history
+
+    logger.info("Conversando con OpenAI (%d mensajes en historial)", len(history))
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT,
+        messages=messages,
+        max_completion_tokens=2000,
+    )
+
+    content = response.choices[0].message.content
+    texto = content.strip() if content else ""
+
+    if not texto:
+        finish = response.choices[0].finish_reason
+        raise RuntimeError(f"Respuesta vacía de OpenAI (finish_reason={finish})")
+
+    # ¿GPT decidió que ya tiene los 3 datos? → devolvió un JSON con "listo"
+    parsed = _try_parse_listo(texto)
+    if parsed:
+        logger.info("GPT detectó datos completos: %s", parsed)
+        return {
+            "tipo":        "listo",
+            "pulgadas":    int(parsed["pulgadas"]),
+            "presupuesto": float(parsed["presupuesto"]),
+            "familia":     str(parsed["familia"]),
+        }
+
+    return {"tipo": "charla", "texto": texto}
+
+
+def _try_parse_listo(texto: str) -> dict | None:
+    """Intenta extraer el JSON {"listo": true, ...} de la respuesta de GPT."""
+    t = texto.strip()
+    # Quitar fences de markdown si los hay
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.startswith("json"):
+            t = t[4:]
+        t = t.strip()
+    try:
+        data = json.loads(t)
+        if isinstance(data, dict) and data.get("listo") is True:
+            if all(k in data for k in ("pulgadas", "presupuesto", "familia")):
+                return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 2. Recomendación final con el top-5 de Databricks
 # ---------------------------------------------------------------------------
 
 def generate_recommendation(
@@ -65,29 +165,22 @@ def generate_recommendation(
     family: str,
     products: list[dict],
 ) -> str:
-    """
-    Llama a gpt-4o-mini con el contexto del usuario y los productos
-    seleccionados por KMeans. Devuelve la respuesta en texto plano.
-    """
+    """Redacta la recomendación final a partir del top-5 de KMeans."""
     client = _get_client()
-
     products_json = json.dumps(products, ensure_ascii=False, indent=2)
 
     user_content = (
-        f"El cliente busca: {user_message}\n\n"
-        f"Parámetros extraídos → pulgadas: {inches}, "
-        f"presupuesto: S/ {budget:.0f}, familia: {family}\n\n"
+        f"El cliente busca: televisor de {inches}\", presupuesto S/ {budget:.0f}, "
+        f"tecnología {family}.\n\n"
         f"Top 5 televisores seleccionados por el modelo KMeans:\n"
         f"```json\n{products_json}\n```\n\n"
-        f"Genera la recomendación al cliente."
+        f"Redacta la recomendación al cliente."
     )
-
-    logger.info("Llamando a Azure OpenAI deployment='%s'", DEPLOYMENT)
 
     response = client.chat.completions.create(
         model=DEPLOYMENT,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": RECOMMENDATION_PROMPT},
             {"role": "user",   "content": user_content},
         ],
         max_completion_tokens=3000,
@@ -96,8 +189,6 @@ def generate_recommendation(
     content = response.choices[0].message.content
     texto = content.strip() if content else ""
 
-    # GPT-5 a veces consume todo en reasoning y devuelve vacío.
-    # Si pasa, lanzamos excepción para que chat() use el fallback estructurado.
     if not texto:
         finish = response.choices[0].finish_reason
         raise RuntimeError(f"Respuesta vacía de OpenAI (finish_reason={finish})")
