@@ -90,7 +90,16 @@ def generate_recommendation(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_content},
         ],
-        max_completion_tokens=700,
+        max_completion_tokens=3000,
     )
 
-    return response.choices[0].message.content.strip()
+    content = response.choices[0].message.content
+    texto = content.strip() if content else ""
+
+    # GPT-5 a veces consume todo en reasoning y devuelve vacío.
+    # Si pasa, lanzamos excepción para que chat() use el fallback estructurado.
+    if not texto:
+        finish = response.choices[0].finish_reason
+        raise RuntimeError(f"Respuesta vacía de OpenAI (finish_reason={finish})")
+
+    return texto
