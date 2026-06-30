@@ -71,19 +71,32 @@ def predict_cluster(pulgadas: int, presupuesto: float, familia: str) -> int:
         pulgadas, presupuesto, familia, familia_num,
     )
 
-    resp = requests.post(
-        SERVING_ENDPOINT_URL,
-        headers=_AUTH_HEADERS,
-        json=payload,
-        timeout=30,
-    )
-    resp.raise_for_status()
+    # El endpoint puede tener scale_to_zero activado: la primera llamada
+    # tras un periodo inactivo dispara un cold start de 2-5 min. Reintentamos
+    # con un timeout amplio para tolerarlo.
+    last_exc = None
+    for intento in range(1, 4):
+        try:
+            resp = requests.post(
+                SERVING_ENDPOINT_URL,
+                headers=_AUTH_HEADERS,
+                json=payload,
+                timeout=180,   # 3 min para tolerar cold start
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            cluster_id = int(data["predictions"][0])
+            logger.info("✅ Cluster asignado: %d (intento %d)", cluster_id, intento)
+            return cluster_id
+        except requests.exceptions.ReadTimeout as exc:
+            last_exc = exc
+            logger.warning("⏳ Timeout en intento %d (posible cold start), reintentando...", intento)
 
-    data = resp.json()
-    # El endpoint devuelve: {"predictions": [<cluster_id>]}
-    cluster_id = int(data["predictions"][0])
-    logger.info("✅ Cluster asignado: %d", cluster_id)
-    return cluster_id
+    raise RuntimeError(
+        "El endpoint de Model Serving no respondió a tiempo. "
+        "Puede estar arrancando (cold start). Intenta de nuevo en unos minutos. "
+        f"Detalle: {last_exc}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -97,37 +110,30 @@ def fetch_top5(
     familia: str,
 ) -> list[dict]:
     """
-    Ejecuta una query SQL sobre la tabla Delta Lake para obtener el top-5
-    de televisores del cluster del usuario dentro del presupuesto (+10 % margen).
+    Consulta la tabla Delta Lake y devuelve el top-5 de televisores.
 
-    Si hay menos de 5 candidatos en el cluster, amplía a toda la familia.
-    Devuelve una lista de dicts con los campos del producto.
+    Estrategia:
+      1. Intenta filtrar por el cluster del usuario (familia_num == cluster_id).
+      2. Si hay < 5 resultados, amplía a todo el catálogo dentro del presupuesto.
+
+    Correcciones de formato de datos reales:
+      - precios son STRING con coma de miles ("1,199.00") y vacíos como "--".
+      - TRY_CAST + NULLIF para evitar que un precio inválido rompa la query.
+      - LEAST con COALESCE para tomar el mínimo entre precios válidos.
+      - pulgadas extraídas del patrón "-NN-" del nombre.
     """
     presupuesto_max = presupuesto * 1.10
-    familia_upper   = familia.upper()
 
-    # La misma lógica de scoring que modelo_televisores.py:
-    # score = (precio / presupuesto) * 100 − |pulgadas − ref| * 2
-    sql = f"""
-    WITH precios AS (
+    # CTE base reutilizable: limpia precios y extrae pulgadas + familia_num
+    base_cte = f"""
+    WITH precios_limpios AS (
       SELECT
-        name,
-        family,
-        seller,
-        url_product,
-        url_image,
-        -- Precio mínimo válido entre los cuatro campos
-        LEAST(
-          CASE WHEN CAST(REGEXP_REPLACE(internet_price, '[^0-9.]', '') AS DOUBLE) > 0
-               THEN CAST(REGEXP_REPLACE(internet_price, '[^0-9.]', '') AS DOUBLE) END,
-          CASE WHEN CAST(REGEXP_REPLACE(event_price,    '[^0-9.]', '') AS DOUBLE) > 0
-               THEN CAST(REGEXP_REPLACE(event_price,    '[^0-9.]', '') AS DOUBLE) END,
-          CASE WHEN CAST(REGEXP_REPLACE(normal_price,   '[^0-9.]', '') AS DOUBLE) > 0
-               THEN CAST(REGEXP_REPLACE(normal_price,   '[^0-9.]', '') AS DOUBLE) END,
-          CASE WHEN CAST(REGEXP_REPLACE(cmr_price,      '[^0-9.]', '') AS DOUBLE) > 0
-               THEN CAST(REGEXP_REPLACE(cmr_price,      '[^0-9.]', '') AS DOUBLE) END
-        ) AS precio,
-        CAST(REGEXP_EXTRACT(name, '\\\\b([2-9][0-9]|1[0-9]{{2}})\\\\b', 1) AS INT) AS pulgadas,
+        name, family, seller, url_product, url_image,
+        TRY_CAST(NULLIF(REGEXP_REPLACE(internet_price, '[^0-9.]', ''), '') AS DOUBLE) AS p_internet,
+        TRY_CAST(NULLIF(REGEXP_REPLACE(event_price,    '[^0-9.]', ''), '') AS DOUBLE) AS p_event,
+        TRY_CAST(NULLIF(REGEXP_REPLACE(normal_price,   '[^0-9.]', ''), '') AS DOUBLE) AS p_normal,
+        TRY_CAST(NULLIF(REGEXP_REPLACE(cmr_price,      '[^0-9.]', ''), '') AS DOUBLE) AS p_cmr,
+        TRY_CAST(REGEXP_EXTRACT(name, '-([0-9]{{2,3}})-', 1) AS INT) AS pulgadas,
         CASE
           WHEN UPPER(family) LIKE '%OLED%'     THEN 2.0
           WHEN UPPER(family) LIKE '%QLED%'     THEN 1.0
@@ -135,72 +141,52 @@ def fetch_top5(
           ELSE 0.0
         END AS familia_num
       FROM {SOURCE_TABLE}
-      WHERE REGEXP_EXTRACT(name, '\\\\b([2-9][0-9]|1[0-9]{{2}})\\\\b', 1) <> ''
     ),
-    cluster_scored AS (
+    con_precio AS (
       SELECT
-        name, family AS familia, pulgadas, precio, seller AS vendedor,
-        url_product AS url, url_image AS imagen,
-        ROUND((precio / {presupuesto}) * 100 - ABS(pulgadas - {pulgadas_ref}) * 2.0, 4) AS score
-      FROM precios
-      WHERE precio IS NOT NULL
-        AND precio > 0
-        AND precio <= {presupuesto_max}
-        AND pulgadas IS NOT NULL
-        -- Filtrar por el cluster: replicamos la lógica familia_num = cluster mapping
-        AND CASE
-              WHEN UPPER(family) LIKE '%OLED%'     THEN 2.0
-              WHEN UPPER(family) LIKE '%QLED%'     THEN 1.0
-              WHEN UPPER(family) LIKE '%NANOCELL%' THEN 3.0
-              ELSE 0.0
-            END = {float(cluster_id)}
+        name, family, seller, url_product, url_image, pulgadas, familia_num,
+        LEAST(
+          COALESCE(NULLIF(p_internet, 0), 999999),
+          COALESCE(NULLIF(p_event,    0), 999999),
+          COALESCE(NULLIF(p_normal,   0), 999999),
+          COALESCE(NULLIF(p_cmr,      0), 999999)
+        ) AS precio
+      FROM precios_limpios
+      WHERE pulgadas IS NOT NULL
     )
-    SELECT name, familia, pulgadas, ROUND(precio, 2) AS precio,
-           vendedor, url, imagen, score
-    FROM cluster_scored
-    ORDER BY score DESC
-    LIMIT 5
     """
 
-    rows = _run_sql(sql)
+    select_tail = f"""
+    SELECT
+      name,
+      family AS familia,
+      pulgadas,
+      ROUND(precio, 2) AS precio,
+      seller AS vendedor,
+      url_product AS url,
+      url_image AS imagen,
+      ROUND((precio / {presupuesto}) * 100 - ABS(pulgadas - {pulgadas_ref}) * 2.0, 2) AS score
+    FROM con_precio
+    WHERE precio < 999999
+      AND precio <= {presupuesto_max}
+    """
 
-    # Si el cluster tiene menos de 5 resultados → ampliar a la familia completa
+    # 1) Intento con filtro de cluster
+    sql_cluster = (
+        base_cte
+        + select_tail
+        + f" AND familia_num = {float(cluster_id)} ORDER BY score DESC LIMIT 5"
+    )
+    rows = _run_sql(sql_cluster)
+
+    # 2) Fallback: sin filtro de cluster, todo el catálogo en presupuesto
     if len(rows) < 5:
         logger.warning(
-            "⚠️  Solo %d candidatos en cluster %d. Ampliando a familia '%s'...",
-            len(rows), cluster_id, familia,
+            "Solo %d candidatos en cluster %d. Ampliando a todo el catálogo...",
+            len(rows), cluster_id,
         )
-        sql_fallback = f"""
-        WITH precios AS (
-          SELECT
-            name, family,
-            seller, url_product, url_image,
-            LEAST(
-              CASE WHEN CAST(REGEXP_REPLACE(internet_price, '[^0-9.]', '') AS DOUBLE) > 0
-                   THEN CAST(REGEXP_REPLACE(internet_price, '[^0-9.]', '') AS DOUBLE) END,
-              CASE WHEN CAST(REGEXP_REPLACE(event_price,    '[^0-9.]', '') AS DOUBLE) > 0
-                   THEN CAST(REGEXP_REPLACE(event_price,    '[^0-9.]', '') AS DOUBLE) END,
-              CASE WHEN CAST(REGEXP_REPLACE(normal_price,   '[^0-9.]', '') AS DOUBLE) > 0
-                   THEN CAST(REGEXP_REPLACE(normal_price,   '[^0-9.]', '') AS DOUBLE) END,
-              CASE WHEN CAST(REGEXP_REPLACE(cmr_price,      '[^0-9.]', '') AS DOUBLE) > 0
-                   THEN CAST(REGEXP_REPLACE(cmr_price,      '[^0-9.]', '') AS DOUBLE) END
-            ) AS precio,
-            CAST(REGEXP_EXTRACT(name, '\\\\b([2-9][0-9]|1[0-9]{{2}})\\\\b', 1) AS INT) AS pulgadas
-          FROM {SOURCE_TABLE}
-          WHERE UPPER(family) LIKE '%{familia_upper}%'
-            AND REGEXP_EXTRACT(name, '\\\\b([2-9][0-9]|1[0-9]{{2}})\\\\b', 1) <> ''
-        )
-        SELECT
-          name, family AS familia, pulgadas, ROUND(precio, 2) AS precio,
-          seller AS vendedor, url_product AS url, url_image AS imagen,
-          ROUND((precio / {presupuesto}) * 100 - ABS(pulgadas - {pulgadas_ref}) * 2.0, 4) AS score
-        FROM precios
-        WHERE precio IS NOT NULL AND precio > 0 AND precio <= {presupuesto_max}
-          AND pulgadas IS NOT NULL
-        ORDER BY score DESC
-        LIMIT 5
-        """
-        rows = _run_sql(sql_fallback)
+        sql_all = base_cte + select_tail + " ORDER BY score DESC LIMIT 5"
+        rows = _run_sql(sql_all)
 
     return rows
 
@@ -234,7 +220,10 @@ def _run_sql(sql: str) -> list[dict]:
         state = stmt["status"]["state"]
 
     if state != "SUCCEEDED":
-        raise RuntimeError(f"SQL statement terminó con estado '{state}'.")
+        # Extraer el mensaje de error real que devuelve Databricks
+        error_info = stmt.get("status", {}).get("error", {})
+        error_msg  = error_info.get("message", "sin detalle")
+        raise RuntimeError(f"SQL statement '{state}': {error_msg}")
 
     col_names = [c["name"] for c in stmt["manifest"]["schema"]["columns"]]
     rows      = stmt.get("result", {}).get("data_array", [])
